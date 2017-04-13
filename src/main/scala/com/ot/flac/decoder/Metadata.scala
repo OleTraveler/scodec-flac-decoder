@@ -53,15 +53,15 @@ case class MetadataBockHeader(
 
   */
 case class StreamInfo(
-  minimumBlockSize: Short,
-  maximumBlockSize: Short,
+  minimumBlockSize: Int,
+  maximumBlockSize: Int,
   minimumFrameSize: Int,
   maximumFrameSize: Int,
   sampleRate: Int,
-  numberOfChannels: Short,
-  bitsPerSample: Short,
+  numberOfChannels: Int,
+  bitsPerSample: Int,
   totalStreams: Long,
-  md5: String
+  md5: BigInt
 ) extends Metadata
 
 /**
@@ -77,10 +77,10 @@ case class Padding(n: Long) extends Metadata
   */
 case class Application(applicationId: Int,applicationData: Array[Byte]) extends Metadata
 
-case class SeekPoint(sampleNumber: Long, offset: Long,numberOfSamples: Short)
+case class SeekPoint(sampleNumber: Long, offset: Long,numberOfSamples: Int)
 
-/** Just an array of SeekPoint, probably don't need this */
-case class SeekTable(seekPoints: Array[SeekPoint]) extends Metadata
+/** Just an array of SeekPoint wrapped so we can claim it extends Metadata */
+case class SeekTable(seekPoints: List[SeekPoint]) extends Metadata
 
 /**
   *

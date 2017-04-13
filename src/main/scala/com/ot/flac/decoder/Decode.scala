@@ -1,16 +1,15 @@
 package com.ot.flac.decoder
 
-import java.nio.{ByteBuffer, ByteOrder}
-import java.nio.channels.{Channel, ReadableByteChannel}
-
-import scala.annotation.tailrec
-import scala.util.Try
+import java.nio.ByteBuffer
+import java.nio.channels.ReadableByteChannel
 
 
 /**
   * Created by tstevens on 4/6/17.
   */
 object Decode {
+
+  import com.ot.util.ByteUtils._
 
   object DecodeError {
     def apply(message: String): DecodeError = DecodeError(message, None)
@@ -32,95 +31,6 @@ object Decode {
     def ** (j: Int): Int = (1 to j).fold(1)( (i1, i2) => i1 * i)
   }
 
-  /** Copied from https://gist.github.com/fbettag/3936752 */
-  def byteToLong(buf: Array[Byte], offset: Int, length: Int): Either[DecodeError, Long] = Try {
-    var ret = 0L
-    var i = offset
-    while (i < offset + length) {
-      ret = ((ret << 8) & 0xffffffff) + (buf(i) & 0xff)
-      i += 1
-    }
-    ret
-  }.toEither.left.map(t => DecodeError("exception while extracting toInt", t))
-
-  def byteToInt(buf: Array[Byte], offset: Int, length: Int): Either[DecodeError, Int] = Try {
-    var ret = 0
-    var i = offset
-    while (i < offset + length) {
-      ret = ((ret << 8) & 0xffffffff) + (buf(i) & 0xff)
-      i += 1
-    }
-    ret
-  }.toEither.left.map(t => DecodeError("exception while extracting toInt", t))
-
-
-  def offsetToMask(offset: Int) : Byte = {
-    offset match {
-      case 0 => 0xFF.toByte
-    }
-  }
-
-  private val BYTE_SIZE = 8
-
-  /** Specify a bit offset (0 based) in an array of bytes and a length and the result will be
-    * an integer representation of the bits popped off the array.
-    *
-    * For instance Array(0x77) is 0111 0111 and if we say offset 2, length 3 the result will be 101
-    * @param buf The Byte array buffer.
-    * @param offset The first bit to start with, 0 based index.
-    * @param length The length
-    * @return
-    * @throws ArrayIndexOutOfBoundsException if offset + length > buf.length * 8
-    */
-  def bitToInt(buf: Array[Byte], offset: Int, length: Int): Int = {
-
-    //the first index to read of buf
-    val firstIndex = offset / BYTE_SIZE
-
-    //the first bit to read of buf(firstIndex)
-    val firstBit = offset % BYTE_SIZE
-
-    //value is negative if the last bit is in the same byte as the first bit
-    val lengthAfterFirstIndex = length - (BYTE_SIZE - firstBit)
-    val fullIndexes = lengthAfterFirstIndex / BYTE_SIZE
-
-    //any remaining bits to read after the full indexes have been read.
-    //note: could also be negative
-    val lastBit = lengthAfterFirstIndex % BYTE_SIZE
-
-    //mask, so only the bits we care about are 1's.
-    //start with the byte part all 1's and shift right to create a mask of just the bits we care about.
-    //so for instance if firstBits is 6, the byte part should be 00000011
-    val firstMask =  0x000000ff >> firstBit
-
-    var i = 0
-    val baseMask = 0x0000FFFF
-    var ret = 0
-    while (i <= fullIndexes) {
-
-      val mask = if (i == 0 && lastBit >= 0) firstMask
-      else if (i == 0 && lastBit < 0) {
-        firstMask & (0xffffffff << Math.abs(lastBit))
-      }
-      else baseMask
-
-      ret = ((ret << 8) & 0xffffffff) + (buf(i) & 0xff & mask)
-
-      if (i == 0 && lastBit < 0) {
-        ret = ret >> Math.abs(lastBit)
-      }
-
-      i += 1
-    }
-
-    if (lastBit > 0) {
-      val mask = 0xffffff00 >> lastBit
-      ret = ((ret << lastBit) & 0xffffffff) + ((buf(i) & mask & 0x000000ff) >> (BYTE_SIZE - lastBit))
-      i = i + 1
-    }
-
-    ret
-  } //.toEither.left.map(t => DecodeError("exception while extracting bitToLong", t))
 
 
   /** aka. "fLaC" */
@@ -140,7 +50,7 @@ object Decode {
   private def readMetadataBlockHeader(ch: ReadableByteChannel): Either[DecodeError, MetadataBockHeader] = {
 
     for {
-      bytes <- nextBytes(8, ch)
+      bytes <- nextBytes(4, ch)
       lastBlock = (bytes(0) & 0x8) == 1 //the first bit is a boolean.
       blockType <- blockTypeFromByte(bytes(0))
 
@@ -154,26 +64,77 @@ object Decode {
   def readMetadataType(header: MetadataBockHeader, body: Array[Byte]) : Either[DecodeError, Metadata] = {
     header.blockType match {
       case MetadataBockHeader.STREAMINFO => readStreamInfo(body)
-      case _ => ???
+      case MetadataBockHeader.PADDING => Right(Padding(body.length))
+      case MetadataBockHeader.APPLICATION => readApplication(body)
+      case MetadataBockHeader.SEEKTABLE => readSeektable(body)
+      case MetadataBockHeader.VORBIS_COMMENT => ???
+      case MetadataBockHeader.CUESHEET => ???
+      case MetadataBockHeader.PICTURE => ???
+      case x => Left(DecodeError(s"Invalid blockType: ${x}"))
     }
   }
 
-  def nowForTheMetadata(ch: ReadableByteChannel) : Either[DecodeError, List[Metadata]] = for {
+  def nowForTheMetadata(ch: ReadableByteChannel) : Either[DecodeError, List[(MetadataBockHeader, Metadata)]] = for {
     header <-readMetadataBlockHeader(ch)
     bodyBytes <- nextBytes(header.length, ch)
     mdBody <- readMetadataType(header, bodyBytes)
-  } yield ???
+    result <- {
+      val tuple = (header, mdBody)
+      if (header.lastMetadataBlock) Right(List( tuple ))
+      else nowForTheMetadata(ch).map( tuple :: _)
+    }
+  } yield result
 
-  def readStreamInfo(bytes: Array[Byte]) : Either[DecodeError, StreamInfo] = for {
-    minBlockSize <- byteToInt(bytes, 0, 2)
-    maxBlockSize <- byteToInt(bytes, 2, 2)
-    minFameSize <- byteToInt(bytes, 4, 3)
-    maxFrameSize <- byteToInt(bytes, 7, 3)
+  def readSeektable(outerBytes: Array[Byte]) : Either[DecodeError, SeekTable] = {
 
-  } yield ???
+    //144 bytes per each seekpoint
+    def readSeekPoint(bytes: Array[Byte], byteOffset: Int) : Either[DecodeError, List[SeekPoint]] = {
+      if (byteOffset > bytes.length) Right(List.empty)
+      else if (byteOffset - bytes.length % 18 != 0) Left(DecodeError(s"expected offset - bytes.length % 144 0= 0, but is ${byteOffset - bytes.length % 144}"))
+      else {
+        for {
+          sample <- byteToLong(bytes, 0, 8).left.map(DecodeError("While reading sample", _))
+          offset <- byteToLong(bytes, 8, 8).left.map(DecodeError("While reading offset", _))
+          numSamples <- byteToInt(bytes, 16, 2).left.map(DecodeError("While reading numSamples", _))
+          result <- {
+            readSeekPoint(bytes, byteOffset + 18).map(SeekPoint(sample, offset, numSamples) :: _)
+          }
+        } yield result
+      }
+    }
+
+    readSeekPoint(outerBytes, 0).map(SeekTable(_))
+
+  }
+
+
+  def readApplication(bytes: Array[Byte]) : Either[DecodeError, Application] = for {
+      appId <- byteToInt(bytes, 0, 4).left.map(DecodeError("While reading application id", _))
+  } yield Application(appId, bytes.drop(4))
+
+
+  /** Read the StreamInfo [https://xiph.org/flac/format.html#metadata_block_streaminfo] block.
+    * @param bytes Should contain bytes specific to StreamInfo.
+    **/
+  def readStreamInfo(bytes: Array[Byte]) : Either[DecodeError, StreamInfo] = {
+
+    for {
+      minBlockSize <- byteToInt(bytes, 0, 2).left.map(DecodeError("While reading minBlockSize", _))
+      maxBlockSize <- byteToInt(bytes, 2, 2).left.map(DecodeError("While reading maxBlockSize", _))
+      minFameSize <- byteToInt(bytes, 4, 3).left.map(DecodeError("While reading minFrameSize", _))
+      maxFrameSize <- byteToInt(bytes, 7, 3).left.map(DecodeError("While reading maxFrameSize", _))
+      sampleRate <- bitToInt(bytes, 80, 20).left.map(DecodeError("While reading sampleRate", _))
+      numberOfChannels <- bitToInt(bytes, 100, 3).map(_ + 1).left.map(DecodeError("While reading numberOfChannels", _))
+      bitsPerSample <- bitToInt(bytes, 103, 5).map(_ + 1).left.map(DecodeError("While reading bitsPerSample", _))
+      totalStreams <- bitToLong(bytes, 108, 36).left.map(DecodeError("While reading totalStreams", _))
+      md5 <- bitToBigInteger(bytes, 144, 128).left.map(DecodeError("While reading md5", _))
+
+    } yield StreamInfo(minBlockSize, maxBlockSize, minFameSize, maxFrameSize, sampleRate, numberOfChannels, bitsPerSample, totalStreams, md5)
+  }
 
 
 
+  /** Read the Flac Metadata from the beginning of the file. */
   def decode(channel: ReadableByteChannel) : Either[DecodeError,List[Metadata]] = {
 
     //ensure this is the start of the flac channel
@@ -183,8 +144,7 @@ object Decode {
       streamInfoHeader <- readMetadataBlockHeader(channel)
       streamInfoBytes <- nextBytes(streamInfoHeader.length, channel)
       streamInfo <- readStreamInfo(streamInfoBytes)
-      mdList <- nowForTheMetadata(channel)
-    } yield mdList
+    } yield List(streamInfoHeader, streamInfo)
 
 
   }
