@@ -2,6 +2,8 @@ package com.ot.flac.decoder
 
 import scodec.{Codec, Decoder}
 import scodec.codecs._
+import scodec.bits._
+
 
 /**
   * Marker interface so we can extract all Metadata info.
@@ -24,26 +26,30 @@ object Metadata {
   import MetadataBlockHeader._
 
   def blockHeaderToMetadataSection(header: MetadataBlockHeader) : Decoder[(MetadataBlockHeader, Metadata)] = {
+    println("header.blockType:" + header.blockType)
     val codec = header.blockType match {
       case STREAMINFO => StreamInfo.codec
-      case PADDING => Padding.codec
+      case PADDING => Padding.codec(header.length)
       case APPLICATION => Application.codec(header.length)
       case SEEKTABLE => SeekTable.codec(header.length)
       case VORBIS_COMMENT => VorbisComment.codec
       case CUESHEET => CueSheet.codec
       case PICTURE => Picture.codec
-      case _ => sys.error("Invalid")
+      case x => sys.error(s"Invalid: $x")
     }
     codec.map(c => (header,c))
   }
 
-  def hc: Decoder[(MetadataBlockHeader, Metadata, Vector[(MetadataBlockHeader, Metadata)])] = MetadataBlockHeader.codec.flatMap(blockHeaderToMetadataSection)
+  def hc: Decoder[(MetadataBlockHeader, Metadata)] = MetadataBlockHeader.codec.flatMap(blockHeaderToMetadataSection)
 
 
 
 }
 
 object MetadataBlockHeader {
+
+  val marker: Codec[Unit] = constant(ByteVector("fLaC".getBytes))
+
   val STREAMINFO: Byte = 0
   val PADDING: Byte = 1
   val APPLICATION: Byte = 2
@@ -100,11 +106,11 @@ case class StreamInfo(
   numberOfChannels: Int,
   bitsPerSample: Int,
   totalStreams: Long,
-  md5: Array[Byte]
+  md5: Vector[Byte]
 ) extends Metadata
 
 object StreamInfo {
-  val baseCodec = uint16 :: uint16 :: uint24 :: uint24 :: uint(20) :: uint(3) :: uint(5) :: ulong(36) :: byte(128)
+  val baseCodec = uint16 :: uint16 :: uint(24) :: uint(24) :: uint(20) :: uint(3) :: uint(5) :: ulong(36) :: vectorOfN(provide(16), byte)
   val codec: Codec[StreamInfo] = baseCodec.as[StreamInfo]
 }
 
@@ -113,13 +119,11 @@ object StreamInfo {
   * n '0' bits (n must be a multiple of 8)
   * @param n number of Byte: 0's.
   */
-case class Padding(n: Long) extends Metadata
+case class Padding(n: Int) extends Metadata
 
 object Padding {
-  import scodec.bits._
-  val baseCodec = vector(constant(bin"00000000")).xmap[Long](_.size, l => (1 to l).map(_ => ()).toVector)
 
-  val codec: Codec[Padding] = baseCodec.as[Padding]
+  def codec(length: Int): Codec[Padding] = (constant(BitVector.low(length)) :: provide(length)).as[Padding]
 }
 
 
@@ -127,10 +131,10 @@ object Padding {
   * @param applicationId 32 bytes - Registered application ID. See https://xiph.org/flac/id.html
   * @param applicationData n bytes - Application data (n must be a multiple of 8)
   */
-case class Application(applicationId: Int,applicationData: Array[Byte]) extends Metadata
+case class Application(applicationId: Long,applicationData: Vector[Byte]) extends Metadata
 
 object Application {
-  def baseCodec(applicationBlockLength: Int) = uint32 :: byte(applicationBlockLength - 8)
+  def baseCodec(applicationBlockLength: Int) = uint32 :: vectorOfN(provide(applicationBlockLength - 32), byte)
 
   /** Codec for Application
     * @param applicationBlockLength The length of this metadata block, defined in MetadataBlockHeader
@@ -146,12 +150,12 @@ object SeekPoint {
 }
 
 /** Just an array of SeekPoint wrapped so we can claim it extends Metadata */
-case class SeekTable(seekPoints: List[SeekPoint]) extends Metadata
+case class SeekTable(seekPoints: Vector[SeekPoint]) extends Metadata
 
 object SeekTable {
   def numberOfSeekPoints(seekTableLength: Int) : Int = seekTableLength / (64 + 64 + 16) //size of SeekPoint
 
-  def baseCodec(length: Int) = sizedVector(length / 8, SeekPoint.codec)
+  def baseCodec(length: Int) = vectorOfN(provide(length / 8), SeekPoint.codec)
 
   def codec(length: Int) = baseCodec(length).as[SeekTable]
 
@@ -159,13 +163,12 @@ object SeekTable {
 
 /**
   *
-  * @param length read an unsigned integer of 32 bits
   * @param userComment this iteration's user comment = read a UTF-8 vector as [length] octets
   */
-case class VorbisUserComment(length: Int, userComment: String)
+case class VorbisUserComment(userComment: String)
 
 object VorbisUserComment {
-  val baseCodec = utf8_32L
+  val baseCodec = variableSizeBitsLong(uint32L.xmap(_ * 8, _ / 8), utf8)
   val codec: Codec[VorbisUserComment] = baseCodec.as[VorbisUserComment]
 }
 
@@ -173,66 +176,56 @@ object VorbisUserComment {
 
 /**
   *
-  * @param vendorLength read an unsigned integer of 32 bits
   * @param vendorString read a UTF-8 vector as [vendorLength] octets
-  * @param commentListLength read an unsigned integer of 32 bits
   * @param userComments array length should be size commentListLength
-  * @param framingBit read a single bit as boolean
   */
-case class VorbisComment(vendorLength: Int, vendorString: String, commentListLength: Int,
-                         userComments: Array[VorbisUserComment], framingBit: Boolean) extends Metadata
+case class VorbisComment(vendorString: String, userComments: Vector[VorbisUserComment]) extends Metadata
 
 object VorbisComment {
 
-  //TODO: Need to fix this.
-  val uint32L2Int = uint32L.xmap[Int](l => {
-    if (l < 0 || l > Int.MaxValue) {
-      sys.error("Need to implement vectorOfN to take Codec[Long]")
-    } else {
-      l.toInt
-    }
-  }, { i => i.toLong })
+  val baseCodec = variableSizeBitsLong(uint32L.xmap(_ * 8, _ / 8), utf8) :: vectorOfN(uint32L.xmap(_.toInt, _.toLong), VorbisUserComment.codec)
 
-  val baseCodec = utf8_32L :: vectorOfN(uint32L2Int, VorbisUserComment.codec)
   val codec: Codec[VorbisComment] = baseCodec.as[VorbisComment]
 }
 
-case class CueSheetIndex(offset: Long, index: Byte)
+case class CueSheetTrackIndex(offset: Long, indexPoint: Int)
 
-object CueSheetIndex {
-  val baseCodec = ulong(64) :: uint8 :: fixedSizeBits(3*8, bytes)
-  val codec: Codec[CueSheetIndex] = baseCodec.as[CueSheetIndex]
+object CueSheetTrackIndex {
+  val baseCodec = ulong(64) :: uint8 :: constant(bin"000000000000000000000000")
+
+  val codec: Codec[CueSheetTrackIndex] = baseCodec.as[CueSheetTrackIndex]
 }
 
-case class CueSheetTrack(trackOffset: Long, trackNumber: Byte, isrc: String, audio: Boolean, preEmphasis: Boolean,
-                         trackIndexPoints: Byte)
+case class CueSheetTrack(trackOffset: Long, trackNumber: Int, isrc: String, audio: Boolean, preEmphasis: Boolean, trackIndexes: Vector[CueSheetTrackIndex])
 
 object CueSheetTrack {
-  val baseCodec = ulong(64) :: uint8 :: fixedSizeBits(12 * 8, ascii) :: bits(1) :: bits(1) ::
-    fixedSizeBits(6 + 13 * 8, bytes) :: vectorOfN( uint8, CueSheetIndex.codec)
+
+  val reservedStr = "0" * (6 + 13 * 8)
+  val reservedBv = BitVector(reservedStr.getBytes)
+
+  val baseCodec = ulong(64) :: uint8 :: fixedSizeBits(12 * 8, ascii) :: bool :: bool :: constant(reservedBv) :: vectorOfN( uint8, CueSheetTrackIndex.codec)
 
   val codec: Codec[CueSheetTrack] = baseCodec.as[CueSheetTrack]
 }
 /**
   *
   */
-case class CueSheet(catalogNumber: String, leadInSamples: Long, correspondsToCd: Boolean, reserved: Array[Byte], numberOfTracks: Int,
-                    cueSheetTracks: Array[CueSheetTrack]) extends Metadata
+case class CueSheet(catalogNumber: String, leadInSamples: Long, correspondsToCd: Boolean, cueSheetTracks: Vector[CueSheetTrack]) extends Metadata
 
 object CueSheet {
-  val baseCodec = fixedSizeBytes(128*8, ascii) :: ulong(64) :: bool :: bytes(7 + 258 * 8) :: vectorOfN(uint8, CueSheetTrack.codec)
+  val reserved = BitVector( ("0" * (7 + 258 * 8)).getBytes )
+  val baseCodec = fixedSizeBytes(128*8, ascii) :: ulong(64) :: bool :: constant(reserved) :: vectorOfN(uint8, CueSheetTrack.codec)
   val codec: Codec[CueSheet] = baseCodec.as[CueSheet]
 }
 
-case class Picture(pictureType: Short, mime: String, description: String, pictureWidth: Long, pictureHeight:Long, colorDepth: Long,
-                   numberOfColors: Long, binaryPicture: Array[Byte]) extends Metadata
+case class Picture(pictureType: Long, mime: String, description: String, pictureWidth: Long, pictureHeight:Long, colorDepth: Long,
+                   numberOfColors: Long, binaryPicture: Vector[Byte]) extends Metadata
 
 
 object Picture {
-  val longTimesEight: Codec[Int] = uint32.xmap[Int](l =>  (l * 8).toInt, i => (i / 8).toLong)
 
-  val basecodec = ushort(32) :: variableSizeBits(longTimesEight, ascii) :: variableSizeBits(longTimesEight, utf8) ::
-    uint32 :: uint32 :: uint32 :: uint32 :: uint32 :: variableSizeBits(longTimesEight, bytes)
+  val basecodec = uint32 :: variableSizeBitsLong(uint32.xmap(_ * 8, _ / 8), ascii) :: variableSizeBitsLong(uint32.xmap(_ * 8, _ / 8), utf8) ::
+    uint32 :: uint32 :: uint32 :: uint32 :: vectorOfN(uint32.xmap(x => (x * 8).toInt, x => (x / 8).toLong), byte)
 
   val codec: Codec[Picture] = basecodec.as[Picture]
 }
