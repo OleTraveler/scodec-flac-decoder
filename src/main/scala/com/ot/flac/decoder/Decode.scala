@@ -2,6 +2,9 @@ package com.ot.flac.decoder
 
 import java.nio.ByteBuffer
 import java.nio.channels.ReadableByteChannel
+import java.nio.charset.Charset
+
+import scodec.bits.{BitVector, ByteOrdering}
 
 
 /**
@@ -17,7 +20,7 @@ object Decode {
   }
   case class DecodeError(message: String, exception: Option[Throwable])
 
-  /** Convenience method to load some bytes from teh channel */
+  /** Convenience method to load some bytes from the channel */
   private def nextBytes(numBytes: Int, channel: ReadableByteChannel) : Either[DecodeError, Array[Byte]] = {
     val flacBuff = ByteBuffer.allocate(numBytes)
     channel.read(flacBuff)
@@ -25,6 +28,13 @@ object Decode {
     val array = flacBuff.array()
     if (array.length == numBytes) Right(array)
     else Left(DecodeError(s"Tried to read ${numBytes} from channel, but only ${array.length} was read."))
+  }
+
+  private def nextBitVector(numBytes: Int, channel: ReadableByteChannel) : BitVector = {
+    val flacBuff = ByteBuffer.allocate(numBytes)
+    channel.read(flacBuff)
+    flacBuff.flip()
+    BitVector(flacBuff)
   }
 
   implicit class IntPower(i: Int) {
@@ -47,7 +57,21 @@ object Decode {
     else Left(DecodeError(s"Invalid Block type: ${byte}"))
   }
 
-  private def readMetadataBlockHeader(ch: ReadableByteChannel): Either[DecodeError, MetadataBockHeader] = {
+  private def readMetadataBlockHeader2(ch: ReadableByteChannel): Either[DecodeError, MetadataBlockHeader] = {
+    import scodec.codecs._
+
+    val comb = bool ~ byte(7) ~ uint(24)
+    val bv = nextBitVector(4, ch)
+
+    for {
+      dec <- comb.decode(bv)
+    } yield {
+      dec.map(x => MetadataBlockHeader(x._1._1, x._1._2, x._2))
+    }
+
+  }
+
+  private def readMetadataBlockHeader(ch: ReadableByteChannel): Either[DecodeError, MetadataBlockHeader] = {
 
     for {
       bytes <- nextBytes(4, ch)
@@ -58,23 +82,23 @@ object Decode {
         bytes.update(0,0) //0 out the 8th bit
         ByteBuffer.wrap(bytes).getInt
       }
-    } yield MetadataBockHeader(lastBlock, blockType, length)
+    } yield MetadataBlockHeader(lastBlock, blockType, length)
   }
 
-  def readMetadataType(header: MetadataBockHeader, body: Array[Byte]) : Either[DecodeError, Metadata] = {
+  def readMetadataType(header: MetadataBlockHeader, body: Array[Byte]) : Either[DecodeError, Metadata] = {
     header.blockType match {
-      case MetadataBockHeader.STREAMINFO => readStreamInfo(body)
-      case MetadataBockHeader.PADDING => Right(Padding(body.length))
-      case MetadataBockHeader.APPLICATION => readApplication(body)
-      case MetadataBockHeader.SEEKTABLE => readSeektable(body)
-      case MetadataBockHeader.VORBIS_COMMENT => ???
-      case MetadataBockHeader.CUESHEET => ???
-      case MetadataBockHeader.PICTURE => ???
+      case MetadataBlockHeader.STREAMINFO => readStreamInfo(body)
+      case MetadataBlockHeader.PADDING => Right(Padding(body.length))
+      case MetadataBlockHeader.APPLICATION => readApplication(body)
+      case MetadataBlockHeader.SEEKTABLE => readSeektable(body)
+      case MetadataBlockHeader.VORBIS_COMMENT => readVorbisComment(body)
+      case MetadataBlockHeader.CUESHEET => ???
+      case MetadataBlockHeader.PICTURE => ???
       case x => Left(DecodeError(s"Invalid blockType: ${x}"))
     }
   }
 
-  def nowForTheMetadata(ch: ReadableByteChannel) : Either[DecodeError, List[(MetadataBockHeader, Metadata)]] = for {
+  def nowForTheMetadata(ch: ReadableByteChannel) : Either[DecodeError, List[(MetadataBlockHeader, Metadata)]] = for {
     header <-readMetadataBlockHeader(ch)
     bodyBytes <- nextBytes(header.length, ch)
     mdBody <- readMetadataType(header, bodyBytes)
@@ -132,6 +156,25 @@ object Decode {
     } yield StreamInfo(minBlockSize, maxBlockSize, minFameSize, maxFrameSize, sampleRate, numberOfChannels, bitsPerSample, totalStreams, md5)
   }
 
+  def readUnsignedIntBytes(bytes: Array[Byte], begin: Int, length: Int): (String, Array[Byte]) = {
+    if (length > 0) {
+      (new String(bytes, begin, length, "UTF-8"), bytes.drop(begin + length))
+    } else {
+      val s1 = new String(bytes, begin, Integer.MAX_VALUE)
+      val b2 = bytes.drop(begin).drop(Integer.MAX_VALUE)
+      (s1 + new String(b2, 0, length - Integer.MAX_VALUE), b2.drop(length - Integer.MAX_VALUE)
+    }
+  }
+
+  def readVorbisComment(bytes: Array[Byte]): Either[DecodeError, VorbisComment] = {
+
+    for {
+      vendorLength <- byteToInt(bytes, 0, 4).left.map(DecodeError("While reading vendorLength", _))
+      vendorStringRemainingBytes <- readUnsignedIntBytes(bytes, 4, vendorLength)
+      comentListLength <-
+    }
+
+  }
 
 
   /** Read the Flac Metadata from the beginning of the file. */
