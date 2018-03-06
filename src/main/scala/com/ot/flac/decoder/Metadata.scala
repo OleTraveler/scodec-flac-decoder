@@ -1,8 +1,11 @@
 package com.ot.flac.decoder
 
-import scodec.{Codec, Decoder}
-import scodec.codecs._
+import com.ot.flac.decoder.DecodeMetadata
+import scodec.Attempt.{Failure, Successful}
 import scodec.bits._
+import scodec.codecs._
+import scodec.{Attempt, Codec, DecodeResult, Decoder}
+import shapeless.HNil
 
 
 /**
@@ -13,36 +16,67 @@ sealed trait Metadata {}
 
 object Metadata {
 
-  case class Header(isLastBlock: Boolean)
-  case class Block(someData: Int)
+  /** Flac spec says we will get at least one Meta Data block*/
+  def decodeHeaders(startOfStream: BitVector) : Attempt[DecodeResult[((MetadataBlockHeader, Metadata), List[(MetadataBlockHeader, Metadata)])]] = {
+    for {
+      a0 <- MetadataBlockHeader.marker.decode(startOfStream)
+      a1 <- Metadata.hc.decode(a0.remainder)
+      list <- repeat(a1)
+    } yield {
+      println(s"a1: ${a1.value}")
+      println(s"list: ${list}")
 
-  object Codec {
-    val headerCodec : Codec[Header] = bool.as[Header]
-    val blockCodec: Codec[Block] = int32.as[Block]
-    val headerBlock: Codec[(Header, Block, Vector[(Header, Block)])] = ???
+      list.map(rs => (a1.value, rs))
+    }
+  }
 
+  /**
+    * Recursive function calculating the result of this headers.
+    * The results should be an Attempt.
+    * If successful;
+    *  1. DecodeResult should be from the last decode so that the remainder is accurate
+    *  2. The list is ordered so that the head of the list is decoded earlier than the end.
+    *
+    * is from the last decode (so that remainder is accurate)
+    * @param priorDecode
+    * @return
+    */
+  private def repeat(priorDecode: DecodeResult[(MetadataBlockHeader, Metadata)]) : Attempt[DecodeResult[List[(MetadataBlockHeader, Metadata)]]] = {
+    if (priorDecode.value._1.lastMetadataBlock) Successful(priorDecode.map(List(_)))
+    else {
+      Metadata.hc.decode(priorDecode.remainder) match {
+        case f: Failure => f
+        case s: Successful[DecodeResult[(MetadataBlockHeader, Metadata)]] => {
+          repeat(s.value) match {
+            case f: Failure => f
+            case Successful(list) => {
+              Successful(list.map(decList => s.value.value :: decList))
+            }
+          }
+        }
+      }
+    }
   }
 
   import MetadataBlockHeader._
 
-  def blockHeaderToMetadataSection(header: MetadataBlockHeader) : Decoder[(MetadataBlockHeader, Metadata)] = {
-    println("header.blockType:" + header.blockType)
+  /** Block header type in the header determines the type of Metadata */
+  private def blockHeaderToMetadataSection(header: MetadataBlockHeader) : Decoder[(MetadataBlockHeader, Metadata)] = {
     val codec = header.blockType match {
       case STREAMINFO => StreamInfo.codec
       case PADDING => Padding.codec(header.length)
       case APPLICATION => Application.codec(header.length)
       case SEEKTABLE => SeekTable.codec(header.length)
-      case VORBIS_COMMENT => VorbisComment.codec
-      case CUESHEET => CueSheet.codec
-      case PICTURE => Picture.codec
+      case VORBIS_COMMENT => VorbisComment.codec.withContext("Vorbis Comment")
+      case CUESHEET => CueSheet.codec.withContext("Cue Sheet")
+      case PICTURE => Picture.codec.withContext("Picture")
       case x => sys.error(s"Invalid: $x")
     }
     codec.map(c => (header,c))
   }
 
-  def hc: Decoder[(MetadataBlockHeader, Metadata)] = MetadataBlockHeader.codec.flatMap(blockHeaderToMetadataSection)
-
-
+  /** The definition of the Block and the Metadata combined is decode first block, then deteremine what type of meta data */
+  private def hc: Decoder[(MetadataBlockHeader, Metadata)] = MetadataBlockHeader.codec.flatMap(blockHeaderToMetadataSection)
 
 }
 
@@ -112,6 +146,8 @@ case class StreamInfo(
 object StreamInfo {
   val baseCodec = uint16 :: uint16 :: uint(24) :: uint(24) :: uint(20) :: uint(3) :: uint(5) :: ulong(36) :: vectorOfN(provide(16), byte)
   val codec: Codec[StreamInfo] = baseCodec.as[StreamInfo]
+
+  uint16 ~ uint2
 }
 
 
@@ -142,10 +178,10 @@ object Application {
   def codec(applicationBlockLength: Int): Codec[Application] = baseCodec(applicationBlockLength).as[Application]
 }
 
-case class SeekPoint(sampleNumber: Long, offset: Long,numberOfSamples: Int)
+case class SeekPoint(sampleNumber: Vector[Byte], offset: Vector[Byte],numberOfSamples: Int)
 
 object SeekPoint {
-  val baseCodec = ulong(64) :: ulong(64) :: uint16
+  val baseCodec = vectorOfN(provide(8), byte) :: vectorOfN(provide(8), byte) :: uint16
   val codec: Codec[SeekPoint] = baseCodec.as[SeekPoint]
 }
 
@@ -155,7 +191,7 @@ case class SeekTable(seekPoints: Vector[SeekPoint]) extends Metadata
 object SeekTable {
   def numberOfSeekPoints(seekTableLength: Int) : Int = seekTableLength / (64 + 64 + 16) //size of SeekPoint
 
-  def baseCodec(length: Int) = vectorOfN(provide(length / 8), SeekPoint.codec)
+  def baseCodec(length: Int) = vectorOfN(provide(length / 18), SeekPoint.codec)
 
   def codec(length: Int) = baseCodec(length).as[SeekTable]
 

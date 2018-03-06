@@ -1,10 +1,7 @@
 package com.ot.flac.decoder
 
-import java.io.File
-
-import scodec.bits.{BitVector, ByteVector}
-import scodec.{Codec, Decoder}
-import scodec.codecs._
+import org.jflac.frame.Frame
+import org.jflac.{FLACDecoder, FrameListener}
 
 
 /**
@@ -12,28 +9,64 @@ import scodec.codecs._
   */
 object DecodeMetadata extends App {
 
-  import java.nio.file.Files
-  import java.nio.file.Paths
+  import java.nio.file.{Files, Paths}
 
-  val path = Paths.get("/Users/tstevens/playspace/flaculence/flac-decoder/src/test/resources/blah.flac")
-  val data = Files.readAllBytes(path);
-  val bv = BitVector(data)
+//  val path = Paths.get("/Users/tstevens/playspace/flaculence/flac-decoder/src/test/resources/blah.flac")
+//  val path = Paths.get("/Users/tstevens/playspace/quodlibet/quodlibet/tests/data/sine-110hz.flac")
+//  val path = Paths.get("/Users/tstevens/Music/flac/nervesandgel - Causality Loops/nervesandgel - Causality Loops - 01 Point Zero - Heavenly Gate.flac")
+//  val path = Paths.get("/Users/tstevens/playspace/jc/mac/Jimmy Cliff - Reggae Greats/Jimmy Cliff - Reggae Greats - 01 - Vietnam.flac")
+//  val path = Paths.get("/Users/tstevens/playspace/jc/lx/Jimmy Cliff/Jimmy Cliff-Reggae Greats/01 - Jimmy Cliff - Vietnam.flac")
+  val path = Paths.get("/Users/tstevens/playspace/jc/mintmin/Jimmy Cliff/Reggae Greats/Disc 1 - 01 - Vietnam.flac")
+  val is = Files.newInputStream(path)
 
-  MetadataBlockHeader.marker
-  val result = for {
-    a0 <- MetadataBlockHeader.marker.decode(bv)
-    a1 <- Metadata.hc.decode(a0.remainder)
-    a2 <- Metadata.hc.decode(a1.remainder)
-    a3 <- Metadata.hc.decode(a2.remainder)
-  } yield {
-    println(s"a1: ${a1.value}")
-    println(s"a2: ${a2.value}")
-    println(s"a3: ${a3.value}")
+  val decoder = new FLACDecoder(is)
 
-    Nil
+  var count = 0
+
+  val fl = new FrameListener {
+    override def processFrame(frame: Frame): Unit = {
+      val crc = frame.getCRC
+      println(s"CRC count ${count} : '${crc & 0xffff}'  HEX: ${Integer.toHexString(crc & 0xffff)}")
+
+      count = count + 1
+
+    }
+
+    override def processError(msg: String): Unit = sys.error("Error: " + msg)
+
+    override def processMetadata(metadata: org.jflac.metadata.Metadata): Unit = {
+      println("METADATA: " + metadata)
+    }
   }
+  decoder.addFrameListener(fl)
 
-  println("Result:" + result)
+  decoder.decode()
+
+
+//  val data = Files.readAllBytes(path)
+//
+//
+//  val bv = BitVector(data)
+//
+//  val result = for {
+//    metadata <- Metadata.decodeHeaders(bv)
+//    f1 <- Frame.headerVariableOrCoded.decode(metadata.remainder)
+//  } yield {
+//    (metadata, f1)
+//  }
+//
+//
+//  result match {
+//    case Successful(res) => {
+//      println("Metadata:" + res._1)
+//      println(s"Frame: ${res._2.value}")
+//      println(s"remainder: ${res._2.remainder}")
+//    }
+//    case f: Failure => println(s"OOPs: ${f.cause}")
+//  }
+
+
+
 
 
 
